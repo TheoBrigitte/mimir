@@ -13,13 +13,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sync"
+	"slices"
 	"syscall"
 	"testing"
-	"time"
+	"testing/synctest"
 
 	"github.com/go-kit/log"
-	"github.com/grafana/dskit/backoff"
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/stretchr/testify/assert"
@@ -32,7 +31,6 @@ const testJobID = "11111111-1111-1111-1111-111111111111"
 
 type backfillTestServer struct {
 	t         *testing.T
-	mtx       sync.Mutex
 	requests  []backfillTestRequest
 	responses map[string][]int
 }
@@ -45,43 +43,33 @@ type backfillTestRequest struct {
 
 func newBackfillTestServer(t *testing.T, responses map[string][]int) (*backfillTestServer, *MimirClient) {
 	s := &backfillTestServer{t: t, responses: responses}
-	srv := httptest.NewServer(s)
-	t.Cleanup(srv.Close)
-
-	c, err := New(Config{Address: srv.URL, ID: "test"}, log.NewNopLogger())
+	c, err := New(Config{Address: "http://mimir", ID: "test"}, log.NewNopLogger())
 	require.NoError(t, err)
-	c.backfillRetries = backoff.Config{MinBackoff: time.Millisecond, MaxBackoff: time.Millisecond, MaxRetries: 3}
+	c.Client.Transport = s
 	return s, c
 }
 
-func (s *backfillTestServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		s.t.Errorf("reading request body: %v", err)
+func (s *backfillTestServer) RoundTrip(r *http.Request) (*http.Response, error) {
+	var body []byte
+	if r.Body != nil {
+		var err error
+		body, err = io.ReadAll(r.Body)
+		require.NoError(s.t, err)
+		require.NoError(s.t, r.Body.Close())
 	}
-
-	s.mtx.Lock()
 	s.requests = append(s.requests, backfillTestRequest{path: r.URL.Path, file: r.URL.Query().Get("path"), body: string(body)})
-	status := http.StatusOK
-	if queued := s.responses[r.URL.Path]; len(queued) > 0 {
-		status = queued[0]
-		s.responses[r.URL.Path] = queued[1:]
-	}
-	s.mtx.Unlock()
 
-	if status != http.StatusOK {
-		http.Error(w, http.StatusText(status), status)
-		return
-	}
-	if r.URL.Path == "/api/v1/backfill/start" {
+	w := httptest.NewRecorder()
+	if queued := s.responses[r.URL.Path]; len(queued) > 0 {
+		s.responses[r.URL.Path] = queued[1:]
+		http.Error(w, http.StatusText(queued[0]), queued[0])
+	} else if r.URL.Path == "/api/v1/backfill/start" {
 		_, _ = fmt.Fprintf(w, `{"job":%q}`, testJobID)
 	}
+	return w.Result(), nil
 }
 
 func (s *backfillTestServer) paths() []string {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-
 	paths := make([]string, 0, len(s.requests))
 	for _, r := range s.requests {
 		paths = append(paths, r.path)
@@ -200,31 +188,31 @@ func TestUploadBackfillBlocks_Retries(t *testing.T) {
 			expectFailure: true,
 		},
 		"gives up after the maximum number of attempts": {
-			responses:     map[string][]int{finishPath: {http.StatusBadGateway, http.StatusBadGateway, http.StatusBadGateway}},
-			expectedPaths: blockRequestPaths(blockID, "start", "files", "files", "finish", "finish", "finish"),
+			responses:     map[string][]int{finishPath: slices.Repeat([]int{http.StatusBadGateway}, 10)},
+			expectedPaths: blockRequestPaths(blockID, append([]string{"start", "files", "files"}, slices.Repeat([]string{"finish"}, 10)...)...),
 			expectFailure: true,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			blockDir := writeTestBlock(t, t.TempDir(), blockID)
-			s, c := newBackfillTestServer(t, tc.responses)
+			synctest.Test(t, func(t *testing.T) {
+				blockDir := writeTestBlock(t, t.TempDir(), blockID)
+				s, c := newBackfillTestServer(t, tc.responses)
 
-			err := c.UploadBackfillBlocks(t.Context(), testJobID, []string{blockDir})
-			if tc.expectFailure {
-				require.EqualError(t, err, fmt.Sprintf("failed to upload 1 block(s) to backfill job %s: %s", testJobID, blockDir))
-			} else {
-				require.NoError(t, err)
-			}
-			assert.Equal(t, tc.expectedPaths, s.paths())
-
-			s.mtx.Lock()
-			defer s.mtx.Unlock()
-			expectedBodies := map[string]string{block.IndexFilename: testIndexContent, "chunks/000001": testChunkContent}
-			for _, r := range s.requests {
-				if r.path == filesPath {
-					assert.Equal(t, expectedBodies[r.file], r.body, "body of %s", r.file)
+				err := c.UploadBackfillBlocks(t.Context(), testJobID, []string{blockDir})
+				if tc.expectFailure {
+					require.EqualError(t, err, fmt.Sprintf("failed to upload 1 block(s) to backfill job %s: %s", testJobID, blockDir))
+				} else {
+					require.NoError(t, err)
 				}
-			}
+				assert.Equal(t, tc.expectedPaths, s.paths())
+
+				expectedBodies := map[string]string{block.IndexFilename: testIndexContent, "chunks/000001": testChunkContent}
+				for _, r := range s.requests {
+					if r.path == filesPath {
+						assert.Equal(t, expectedBodies[r.file], r.body, "body of %s", r.file)
+					}
+				}
+			})
 		})
 	}
 }

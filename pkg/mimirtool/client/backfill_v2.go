@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -144,7 +145,11 @@ func (c *MimirClient) uploadBackfillBlock(ctx context.Context, jobID, blockDir s
 }
 
 func (c *MimirClient) doBackfillV2Request(ctx context.Context, path string, newBody backfillRequestBody) (bool, error) {
-	retries := backoff.New(ctx, c.backfillRetries)
+	retries := backoff.New(ctx, backoff.Config{
+		MinBackoff: time.Second,
+		MaxBackoff: 30 * time.Second,
+		MaxRetries: 10,
+	})
 	for {
 		resp, retryable, err := c.sendBackfillV2Request(ctx, path, newBody)
 		if err == nil {

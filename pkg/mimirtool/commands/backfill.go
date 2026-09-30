@@ -52,14 +52,14 @@ func (c *BackfillCommand) Register(app *kingpin.Application, envVars EnvVarNames
 	})
 	cmd.Arg("block-dir", "block to upload").Required().SetValue(&c.blocks)
 
-	registerBackfillClientFlags(cmd, envVars, &c.clientConfig)
+	registerMimirConnectionFlags(cmd, envVars, &c.clientConfig)
 
 	cmd.Flag("sleep-time", "How long to sleep between checking state of block upload after uploading all files for the block.").
 		Default("20s").
 		DurationVar(&c.sleepTime)
 }
 
-func registerBackfillClientFlags(cmd *kingpin.CmdClause, envVars EnvVarNames, cfg *client.Config) {
+func registerMimirConnectionFlags(cmd *kingpin.CmdClause, envVars EnvVarNames, cfg *client.Config) {
 	cmd.Flag("address", "Address of the Grafana Mimir cluster; alternatively, set "+envVars.Address+".").
 		Envar(envVars.Address).
 		Required().

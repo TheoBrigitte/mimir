@@ -23,7 +23,7 @@ type BackfillV2Command struct {
 
 func (c *BackfillV2Command) Register(app *kingpin.Application, envVars EnvVarNames, logConfig *LoggerConfig) {
 	cmd := app.Command("backfill-v2", "Upload Prometheus TSDB blocks to Grafana Mimir with the v2 backfill API. Blocks are uploaded into a backfill job, and finishing the job hands it off for asynchronous processing.")
-	registerBackfillClientFlags(cmd, envVars, &c.clientConfig)
+	registerMimirConnectionFlags(cmd, envVars, &c.clientConfig)
 
 	cmd.Command("start", "Start a new backfill job and print its ID to stdout.").
 		Action(c.action(logConfig, c.start))
