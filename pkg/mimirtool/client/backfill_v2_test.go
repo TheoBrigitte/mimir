@@ -3,14 +3,18 @@
 package client
 
 import (
-	"encoding/json"
+	"context"
+	"crypto/x509"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -85,39 +89,67 @@ func (s *backfillTestServer) paths() []string {
 	return paths
 }
 
-func writeTestBlock(t *testing.T, dir string, blockID ulid.ULID, chunk string) string {
+const (
+	testIndexContent = "index-content"
+	testChunkContent = "chunk-content"
+)
+
+func writeTestBlock(t *testing.T, dir string, blockID ulid.ULID) string {
 	blockDir := filepath.Join(dir, blockID.String())
 	require.NoError(t, os.MkdirAll(filepath.Join(blockDir, block.ChunksDirname), 0o755))
 
-	meta, err := json.Marshal(block.Meta{BlockMeta: tsdb.BlockMeta{ULID: blockID, Version: 1, MinTime: 100, MaxTime: 200}})
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(blockDir, block.MetaFilename), meta, 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(blockDir, block.IndexFilename), []byte("index"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(blockDir, block.ChunksDirname, "000001"), []byte(chunk), 0o644))
+	meta := block.Meta{BlockMeta: tsdb.BlockMeta{ULID: blockID, Version: 1, MinTime: 100, MaxTime: 200}}
+	require.NoError(t, meta.WriteToDir(log.NewNopLogger(), blockDir))
+	require.NoError(t, os.WriteFile(filepath.Join(blockDir, block.IndexFilename), []byte(testIndexContent), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(blockDir, block.ChunksDirname, "000001"), []byte(testChunkContent), 0o644))
 	return blockDir
+}
+
+func blockRequestPath(blockID ulid.ULID, step string) string {
+	return "/api/v1/backfill/" + testJobID + "/block/" + blockID.String() + "/" + step
 }
 
 func blockRequestPaths(blockID ulid.ULID, steps ...string) []string {
 	paths := make([]string, 0, len(steps))
 	for _, step := range steps {
-		paths = append(paths, "/api/v1/backfill/"+testJobID+"/block/"+blockID.String()+"/"+step)
+		paths = append(paths, blockRequestPath(blockID, step))
 	}
 	return paths
 }
 
-func TestStartBackfillJob(t *testing.T) {
-	_, c := newBackfillTestServer(t, nil)
+func TestStartAndFinishBackfillJob(t *testing.T) {
+	s, c := newBackfillTestServer(t, nil)
 
 	jobID, err := c.StartBackfillJob(t.Context())
 	require.NoError(t, err)
-	assert.Equal(t, testJobID, jobID)
+	require.Equal(t, testJobID, jobID)
+	require.NoError(t, c.FinishBackfillJob(t.Context(), jobID))
+	assert.Equal(t, []string{"/api/v1/backfill/start", "/api/v1/backfill/" + testJobID + "/finish"}, s.paths())
 }
 
-func TestFinishBackfillJob(t *testing.T) {
-	s, c := newBackfillTestServer(t, nil)
+func TestStartBackfillJob_DoesNotRetry(t *testing.T) {
+	s, c := newBackfillTestServer(t, map[string][]int{"/api/v1/backfill/start": {http.StatusServiceUnavailable}})
 
-	require.NoError(t, c.FinishBackfillJob(t.Context(), testJobID))
-	assert.Equal(t, []string{"/api/v1/backfill/" + testJobID + "/finish"}, s.paths())
+	_, err := c.StartBackfillJob(t.Context())
+	require.ErrorContains(t, err, "503 Service Unavailable")
+	assert.Equal(t, []string{"/api/v1/backfill/start"}, s.paths())
+}
+
+func TestIsTransientNetworkError(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err       error
+		transient bool
+	}{
+		"connection refused":    {err: &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}, transient: true},
+		"broken pipe":           {err: &net.OpError{Op: "write", Err: os.NewSyscallError("write", syscall.EPIPE)}, transient: true},
+		"timeout":               {err: &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}, transient: true},
+		"untrusted certificate": {err: x509.UnknownAuthorityError{}, transient: false},
+		"cancelled context":     {err: context.Canceled, transient: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.transient, isTransientNetworkError(&url.Error{Op: "Post", URL: "http://x", Err: tc.err}))
+		})
+	}
 }
 
 func TestUploadBackfillBlocks(t *testing.T) {
@@ -125,13 +157,13 @@ func TestUploadBackfillBlocks(t *testing.T) {
 	uploaded := ulid.MustNew(1000, nil)
 	rejected := ulid.MustNew(2000, nil)
 	existing := ulid.MustNew(3000, nil)
-	uploadedDir := writeTestBlock(t, dir, uploaded, "chunk")
-	rejectedDir := writeTestBlock(t, dir, rejected, "chunk")
-	existingDir := writeTestBlock(t, dir, existing, "chunk")
+	uploadedDir := writeTestBlock(t, dir, uploaded)
+	rejectedDir := writeTestBlock(t, dir, rejected)
+	existingDir := writeTestBlock(t, dir, existing)
 
 	s, c := newBackfillTestServer(t, map[string][]int{
-		blockRequestPaths(rejected, "start")[0]: {http.StatusUnprocessableEntity},
-		blockRequestPaths(existing, "start")[0]: {http.StatusConflict},
+		blockRequestPath(rejected, "start"): {http.StatusUnprocessableEntity},
+		blockRequestPath(existing, "start"): {http.StatusConflict},
 	})
 
 	err := c.UploadBackfillBlocks(t.Context(), testJobID, []string{uploadedDir, rejectedDir, existingDir})
@@ -146,29 +178,21 @@ func TestUploadBackfillBlocks(t *testing.T) {
 
 func TestUploadBackfillBlocks_Retries(t *testing.T) {
 	blockID := ulid.MustNew(1000, nil)
-	filesPath := blockRequestPaths(blockID, "files")[0]
-	finishPath := blockRequestPaths(blockID, "finish")[0]
+	filesPath := blockRequestPath(blockID, "files")
+	finishPath := blockRequestPath(blockID, "finish")
 
 	for name, tc := range map[string]struct {
 		responses     map[string][]int
 		expectedPaths []string
 		expectFailure bool
 	}{
-		"retries a transient file upload failure and sends the whole file again": {
+		"retries a file upload and sends the whole file again": {
 			responses:     map[string][]int{filesPath: {http.StatusServiceUnavailable}},
 			expectedPaths: blockRequestPaths(blockID, "start", "files", "files", "files", "finish"),
 		},
-		"retries 429": {
-			responses:     map[string][]int{finishPath: {http.StatusTooManyRequests}},
-			expectedPaths: blockRequestPaths(blockID, "start", "files", "files", "finish", "finish"),
-		},
-		"treats a conflict on a retried finish as success": {
-			responses:     map[string][]int{finishPath: {http.StatusInternalServerError, http.StatusConflict}},
-			expectedPaths: blockRequestPaths(blockID, "start", "files", "files", "finish", "finish"),
-		},
-		"treats a conflict on the first finish as an existing block": {
-			responses:     map[string][]int{finishPath: {http.StatusConflict}},
-			expectedPaths: blockRequestPaths(blockID, "start", "files", "files", "finish"),
+		"retries 429 and 5xx, and treats a conflict on a retried finish as success": {
+			responses:     map[string][]int{finishPath: {http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusConflict}},
+			expectedPaths: blockRequestPaths(blockID, "start", "files", "files", "finish", "finish", "finish"),
 		},
 		"does not retry other 4xx": {
 			responses:     map[string][]int{filesPath: {http.StatusBadRequest}},
@@ -182,7 +206,7 @@ func TestUploadBackfillBlocks_Retries(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			blockDir := writeTestBlock(t, t.TempDir(), blockID, "chunk-content")
+			blockDir := writeTestBlock(t, t.TempDir(), blockID)
 			s, c := newBackfillTestServer(t, tc.responses)
 
 			err := c.UploadBackfillBlocks(t.Context(), testJobID, []string{blockDir})
@@ -195,7 +219,7 @@ func TestUploadBackfillBlocks_Retries(t *testing.T) {
 
 			s.mtx.Lock()
 			defer s.mtx.Unlock()
-			expectedBodies := map[string]string{block.IndexFilename: "index", "chunks/000001": "chunk-content"}
+			expectedBodies := map[string]string{block.IndexFilename: testIndexContent, "chunks/000001": testChunkContent}
 			for _, r := range s.requests {
 				if r.path == filesPath {
 					assert.Equal(t, expectedBodies[r.file], r.body, "body of %s", r.file)

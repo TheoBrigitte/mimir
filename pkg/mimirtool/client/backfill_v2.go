@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -35,7 +37,7 @@ type backfillRequestBody func() (body io.ReadCloser, size int64, err error)
 
 // TODO: add manifest support
 func (c *MimirClient) StartBackfillJob(ctx context.Context) (string, error) {
-	resp, _, err := c.doBackfillV2Request(ctx, path.Join(backfillV2EndpointPrefix, "start"), nil)
+	resp, _, err := c.sendBackfillV2Request(ctx, path.Join(backfillV2EndpointPrefix, "start"), nil)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to start backfill job")
 	}
@@ -52,11 +54,9 @@ func (c *MimirClient) StartBackfillJob(ctx context.Context) (string, error) {
 }
 
 func (c *MimirClient) FinishBackfillJob(ctx context.Context, jobID string) error {
-	resp, _, err := c.doBackfillV2Request(ctx, path.Join(backfillV2EndpointPrefix, url.PathEscape(jobID), "finish"), nil)
-	if err != nil {
+	if _, err := c.doBackfillV2Request(ctx, path.Join(backfillV2EndpointPrefix, url.PathEscape(jobID), "finish"), nil); err != nil {
 		return errors.Wrapf(err, "failed to finish backfill job %s", jobID)
 	}
-	drainAndCloseBody(resp)
 	return nil
 }
 
@@ -115,11 +115,9 @@ func (c *MimirClient) uploadBackfillBlock(ctx context.Context, jobID, blockDir s
 	logger = log.With(logger, "block", blockID)
 
 	level.Info(logger).Log("msg", "starting block upload")
-	resp, _, err := c.doBackfillV2Request(ctx, path.Join(blockPath, "start"), bytesRequestBody(metaJSON))
-	if err != nil {
+	if _, err := c.doBackfillV2Request(ctx, path.Join(blockPath, "start"), bytesRequestBody(metaJSON)); err != nil {
 		return errors.Wrap(err, "request to start block upload failed")
 	}
-	drainAndCloseBody(resp)
 
 	// TODO: support for skipping already uploaded files
 	for _, f := range meta.Thanos.Files {
@@ -129,20 +127,15 @@ func (c *MimirClient) uploadBackfillBlock(ctx context.Context, jobID, blockDir s
 
 		level.Info(logger).Log("msg", "uploading block file", "file", f.RelPath, "size", f.SizeBytes)
 		filePath := fmt.Sprintf("%s?path=%s", path.Join(blockPath, "files"), url.QueryEscape(f.RelPath))
-		resp, _, err := c.doBackfillV2Request(ctx, filePath, bucketObjectRequestBody(ctx, bkt, path.Join(blockID.String(), f.RelPath), f.SizeBytes))
-		if err != nil {
+		if _, err := c.doBackfillV2Request(ctx, filePath, bucketObjectRequestBody(ctx, bkt, path.Join(blockID.String(), f.RelPath), f.SizeBytes)); err != nil {
 			return errors.Wrapf(err, "request to upload file %q failed", f.RelPath)
 		}
-		drainAndCloseBody(resp)
 	}
 
-	resp, retried, err := c.doBackfillV2Request(ctx, path.Join(blockPath, "finish"), nil)
-	switch {
-	case err == nil:
-		drainAndCloseBody(resp)
-	case retried && errors.Is(err, ErrConflict):
+	retried, err := c.doBackfillV2Request(ctx, path.Join(blockPath, "finish"), nil)
+	if retried && errors.Is(err, ErrConflict) {
 		level.Debug(logger).Log("msg", "an earlier attempt already finished the block upload")
-	default:
+	} else if err != nil {
 		return errors.Wrap(err, "request to finish block upload failed")
 	}
 
@@ -150,17 +143,20 @@ func (c *MimirClient) uploadBackfillBlock(ctx context.Context, jobID, blockDir s
 	return nil
 }
 
-func (c *MimirClient) doBackfillV2Request(ctx context.Context, path string, newBody backfillRequestBody) (*http.Response, bool, error) {
+func (c *MimirClient) doBackfillV2Request(ctx context.Context, path string, newBody backfillRequestBody) (bool, error) {
 	retries := backoff.New(ctx, c.backfillRetries)
 	for {
 		resp, retryable, err := c.sendBackfillV2Request(ctx, path, newBody)
+		if err == nil {
+			drainAndCloseBody(resp)
+		}
 		if err == nil || !retryable {
-			return resp, retries.NumRetries() > 0, err
+			return retries.NumRetries() > 0, err
 		}
 
 		retries.Wait()
 		if !retries.Ongoing() {
-			return nil, true, err
+			return true, err
 		}
 		level.Warn(c.logger).Log("msg", "retrying backfill request", "path", path, "retry", retries.NumRetries(), "err", err)
 	}
@@ -180,7 +176,7 @@ func (c *MimirClient) sendBackfillV2Request(ctx context.Context, path string, ne
 
 	req, resp, err := c.executeRequest(ctx, path, http.MethodPost, payload, contentLength)
 	if err != nil {
-		return nil, ctx.Err() == nil, err
+		return nil, ctx.Err() == nil && isTransientNetworkError(err), err
 	}
 
 	retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError
@@ -188,6 +184,16 @@ func (c *MimirClient) sendBackfillV2Request(ctx context.Context, path string, ne
 		return nil, retryable, err
 	}
 	return resp, false, nil
+}
+
+func isTransientNetworkError(err error) bool {
+	var netErr net.Error
+	return (errors.As(err, &netErr) && netErr.Timeout()) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 func bytesRequestBody(b []byte) backfillRequestBody {
