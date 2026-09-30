@@ -17,6 +17,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/backoff"
 	"github.com/grafana/dskit/crypto/tls"
 	"github.com/grafana/dskit/user"
 	"github.com/pkg/errors"
@@ -74,6 +75,8 @@ type MimirClient struct {
 	authToken    string
 	extraHeaders map[string]string
 	logger       log.Logger
+
+	backfillRetries backoff.Config
 }
 
 // New returns a new MimirClient.
@@ -135,6 +138,12 @@ func New(cfg Config, logger log.Logger) (*MimirClient, error) {
 		authToken:    cfg.AuthToken,
 		extraHeaders: cfg.ExtraHeaders,
 		logger:       logger,
+
+		backfillRetries: backoff.Config{
+			MinBackoff: time.Second,
+			MaxBackoff: 30 * time.Second,
+			MaxRetries: 10,
+		},
 	}, nil
 }
 

@@ -51,57 +51,61 @@ func (c *BackfillCommand) Register(app *kingpin.Application, envVars EnvVarNames
 	})
 	cmd.Arg("block-dir", "block to upload").Required().SetValue(&c.blocks)
 
+	registerBackfillClientFlags(cmd, envVars, &c.clientConfig)
+
+	cmd.Flag("sleep-time", "How long to sleep between checking state of block upload after uploading all files for the block.").
+		Default("20s").
+		DurationVar(&c.sleepTime)
+}
+
+func registerBackfillClientFlags(cmd *kingpin.CmdClause, envVars EnvVarNames, cfg *client.Config) {
 	cmd.Flag("address", "Address of the Grafana Mimir cluster; alternatively, set "+envVars.Address+".").
 		Envar(envVars.Address).
 		Required().
-		StringVar(&c.clientConfig.Address)
+		StringVar(&cfg.Address)
 
 	cmd.Flag("user",
 		fmt.Sprintf("Basic auth username to use when contacting Grafana Mimir; alternatively, set %s. If empty, %s is used instead.", envVars.APIUser, envVars.TenantID)).
 		Default("").
 		Envar(envVars.APIUser).
-		StringVar(&c.clientConfig.User)
+		StringVar(&cfg.User)
 
 	cmd.Flag("id", "Grafana Mimir tenant ID. Used for X-Scope-OrgID HTTP header. Also used for basic auth if --user is not provided. Alternatively, set "+envVars.TenantID+".").
 		Envar(envVars.TenantID).
 		Required().
-		StringVar(&c.clientConfig.ID)
+		StringVar(&cfg.ID)
 
 	cmd.Flag("key", "Basic auth password to use when contacting Grafana Mimir; alternatively, set "+envVars.APIKey+".").
 		Default("").
 		Envar(envVars.APIKey).
-		StringVar(&c.clientConfig.Key)
+		StringVar(&cfg.Key)
 
-	registerSigV4Flags(cmd, envVars, &c.clientConfig.SigV4)
+	registerSigV4Flags(cmd, envVars, &cfg.SigV4)
 
-	c.clientConfig.ExtraHeaders = map[string]string{}
+	cfg.ExtraHeaders = map[string]string{}
 	cmd.Flag("extra-headers", "Extra headers to add to the requests in header=value format, alternatively set newline separated "+envVars.ExtraHeaders+".").
 		Envar(envVars.ExtraHeaders).
-		StringMapVar(&c.clientConfig.ExtraHeaders)
+		StringMapVar(&cfg.ExtraHeaders)
 
 	cmd.Flag("tls-ca-path", "TLS CA certificate to verify Grafana Mimir API as part of mTLS; alternatively, set "+envVars.TLSCAPath+".").
 		Default("").
 		Envar(envVars.TLSCAPath).
-		StringVar(&c.clientConfig.TLS.CAPath)
+		StringVar(&cfg.TLS.CAPath)
 
 	cmd.Flag("tls-cert-path", "TLS client certificate to authenticate with the Grafana Mimir API as part of mTLS; alternatively, set "+envVars.TLSCertPath+".").
 		Default("").
 		Envar(envVars.TLSCertPath).
-		StringVar(&c.clientConfig.TLS.CertPath)
+		StringVar(&cfg.TLS.CertPath)
 
 	cmd.Flag("tls-key-path", "TLS client certificate private key to authenticate with the Grafana Mimir API as part of mTLS; alternatively, set "+envVars.TLSKeyPath+".").
 		Default("").
 		Envar(envVars.TLSKeyPath).
-		StringVar(&c.clientConfig.TLS.KeyPath)
+		StringVar(&cfg.TLS.KeyPath)
 
 	cmd.Flag("tls-insecure-skip-verify", "Skip TLS certificate verification; alternatively, set "+envVars.TLSInsecureSkipVerify+".").
 		Default("false").
 		Envar(envVars.TLSInsecureSkipVerify).
-		BoolVar(&c.clientConfig.TLS.InsecureSkipVerify)
-
-	cmd.Flag("sleep-time", "How long to sleep between checking state of block upload after uploading all files for the block.").
-		Default("20s").
-		DurationVar(&c.sleepTime)
+		BoolVar(&cfg.TLS.InsecureSkipVerify)
 }
 
 func (c *BackfillCommand) backfill(logger log.Logger) error {
